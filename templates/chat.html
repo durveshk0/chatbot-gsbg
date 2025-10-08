@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>GSBG Chatbot</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f9f9f9; }
+    #chatbox { width: 400px; margin: 50px auto; border: 1px solid #ccc; border-radius: 10px; padding: 15px; background: #fff; }
+    #messages { height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; }
+    .msg { margin: 5px 0; }
+    .user { color: blue; }
+    .bot { color: green; }
+    #inputRow { display: flex; }
+    #userInput { flex: 1; padding: 8px; border-radius: 5px; border: 1px solid #ccc; }
+    button { padding: 8px 12px; margin-left: 5px; border: none; background: #007bff; color: white; border-radius: 5px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="chatbox">
+    <div id="messages"></div>
+    <div id="inputRow">
+      <input type="text" id="userInput" placeholder="Type your message..." />
+      <button onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    async function sendMessage() {
+      const input = document.getElementById("userInput");
+      const msg = input.value.trim();
+      if (!msg) return;
+  
+      // Show user message
+      const messagesDiv = document.getElementById("messages");
+      messagesDiv.innerHTML += `<div class="msg user"><b>You:</b> ${msg}</div>`;
+      input.value = "";
+  
+      try {
+        // ✅ Fixed: relative fetch
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: msg })
+        });
+  
+        const data = await res.json();
+        messagesDiv.innerHTML += `<div class="msg bot"><b>Bot:</b> ${data.response}</div>`;
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      } catch (err) {
+        messagesDiv.innerHTML += `<div class="msg bot"><b>Bot:</b> ❌ Error connecting to server</div>`;
+      }
+    }
+  </script>
+</body>
+</html>
