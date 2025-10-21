@@ -4,52 +4,120 @@
   <meta charset="UTF-8">
   <title>GSBG Chatbot</title>
   <style>
-    body { font-family: Arial, sans-serif; background: #f9f9f9; }
-    #chatbox { width: 400px; margin: 50px auto; border: 1px solid #ccc; border-radius: 10px; padding: 15px; background: #fff; }
-    #messages { height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; }
-    .msg { margin: 5px 0; }
-    .user { color: blue; }
-    .bot { color: green; }
-    #inputRow { display: flex; }
-    #userInput { flex: 1; padding: 8px; border-radius: 5px; border: 1px solid #ccc; }
-    button { padding: 8px 12px; margin-left: 5px; border: none; background: #007bff; color: white; border-radius: 5px; cursor: pointer; }
+    body {
+      font-family: "Segoe UI", sans-serif;
+      background: #f4f7fb;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      justify-content: center;
+      align-items: center;
+    }
+    .chatbox {
+      width: 400px;
+      height: 500px;
+      background: #fff;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .header {
+      background: #004aad;
+      color: #fff;
+      padding: 12px;
+      text-align: center;
+      font-weight: bold;
+    }
+    .messages {
+      flex: 1;
+      padding: 15px;
+      overflow-y: auto;
+    }
+    .msg {
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+    .user {
+      text-align: right;
+      color: #333;
+    }
+    .bot {
+      text-align: left;
+      color: #004aad;
+    }
+    .input-area {
+      display: flex;
+      border-top: 1px solid #ddd;
+    }
+    input {
+      flex: 1;
+      padding: 12px;
+      border: none;
+      outline: none;
+      font-size: 15px;
+    }
+    button {
+      background: #004aad;
+      color: white;
+      border: none;
+      padding: 12px 20px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #0066ff;
+    }
   </style>
 </head>
 <body>
-  <div id="chatbox">
-    <div id="messages"></div>
-    <div id="inputRow">
-      <input type="text" id="userInput" placeholder="Type your message..." />
+  <div class="chatbox">
+    <div class="header">💬 GSBG AI Chatbot</div>
+    <div class="messages" id="chat"></div>
+    <div class="input-area">
+      <input id="userInput" type="text" placeholder="Type your message...">
       <button onclick="sendMessage()">Send</button>
     </div>
   </div>
 
   <script>
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('userInput');
+
+    function appendMessage(text, cls) {
+      const msg = document.createElement('div');
+      msg.className = 'msg ' + cls;
+      msg.innerText = text;
+      chat.appendChild(msg);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
     async function sendMessage() {
-      const input = document.getElementById("userInput");
-      const msg = input.value.trim();
-      if (!msg) return;
-  
-      // Show user message
-      const messagesDiv = document.getElementById("messages");
-      messagesDiv.innerHTML += `<div class="msg user"><b>You:</b> ${msg}</div>`;
-      input.value = "";
-  
+      const text = input.value.trim();
+      if (!text) return;
+      appendMessage(text, 'user');
+      input.value = '';
+      appendMessage('Typing...', 'bot');
+
       try {
-        // ✅ Fixed: relative fetch
-        const res = await fetch("/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: msg })
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: text })
         });
-  
         const data = await res.json();
-        messagesDiv.innerHTML += `<div class="msg bot"><b>Bot:</b> ${data.response}</div>`;
-        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-      } catch (err) {
-        messagesDiv.innerHTML += `<div class="msg bot"><b>Bot:</b> ❌ Error connecting to server</div>`;
+        chat.lastChild.remove(); // remove "Typing..."
+        appendMessage(data.answer || 'No response', 'bot');
+      } catch (e) {
+        chat.lastChild.remove();
+        appendMessage('Error connecting to chatbot.', 'bot');
       }
     }
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
   </script>
 </body>
 </html>

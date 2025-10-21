@@ -1,328 +1,190 @@
-import os
-import re
-import json
-import pickle
-import logging
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template
+# =============================================
+# 🚀 GSBG AI Chatbot (with Frontend UI + Smart Cache)
+# =============================================
+from flask import Flask, request, jsonify, send_from_directory
 import numpy as np
-import sqlite3
+import sqlite3, os, json, logging, threading, time
 from sentence_transformers import SentenceTransformer
-import requests
-from twilio.rest import Client
+import ollama
 
+# -------------------- CONFIG --------------------
+app = Flask(__name__, static_folder="static")
+PORT = 5000
+KB_PATH = "kb"
+DB_PATH = "database/chatlogs.db"
+MODEL_NAME = "mistral:latest"
 
-import os
-from dotenv import load_dotenv
+# -------------------- INIT --------------------
+os.makedirs("database", exist_ok=True)
+os.makedirs(KB_PATH, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.info("🚀 Starting GSBG Chatbot...")
 
-load_dotenv()
-# Optional FAISS
+# -------------------- LOAD KNOWLEDGE BASE --------------------
 try:
-    import faiss
-except Exception:
-    faiss = None
+    with open(f"{KB_PATH}/kb_chunks.json", "r", encoding="utf-8") as f:
+        kb_chunks = json.load(f)
+    kb_embeddings = np.load(f"{KB_PATH}/kb_embeddings.npy")
+    kb_embeddings = kb_embeddings / np.linalg.norm(kb_embeddings, axis=1, keepdims=True)
+    logging.info(f"✅ Knowledge base loaded with {len(kb_chunks)} chunks.")
+except Exception as e:
+    logging.warning(f"⚠️ No KB found or failed to load: {e}")
+    kb_chunks, kb_embeddings = [], np.zeros((0,))
 
-# ---------------- CONFIG ----------------
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:latest")
+# -------------------- EMBEDDING MODEL --------------------
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+query_cache = {}
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+# -------------------- STATIC RESPONSES --------------------
+STATIC_RESPONSES = {
+    "hello": "👋 Hello! I’m the GSBG AI Assistant. How can I help you today?",
+    "hi": "Hi there! I’m GSBG Technologies’ AI assistant — ready to assist you.",
+    "who are you": "I’m GSBG Technologies’ AI Assistant. GSBG is a Salesforce CRM and Consulting Partner specializing in CRM solutions and FinTech consulting.",
+    "what is gsbg": "GSBG Technologies is a Salesforce CRM and Consulting Partner delivering cloud, CRM, and financial technology solutions.",
+    "contact": "📞 You can reach GSBG Technologies at +91-XXXXXXXXXX or email us at contact@gsbgtech.com.",
+    "email": "✉️ Our official email is contact@gsbgtech.com.",
+    "services": "We specialize in Salesforce CRM implementation, automation, financial technology consulting, and AI-driven business solutions.",
+}
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# -------------------- PRELOAD MODEL --------------------
+def preload_model():
+    try:
+        logging.info("🧠 Preloading Ollama model into memory...")
+        ollama.pull(MODEL_NAME)
+        ollama.chat(model=MODEL_NAME, messages=[{"role": "system", "content": "Warmup"}])
+        logging.info(f"✅ Model {MODEL_NAME} is ready.")
+    except Exception as e:
+        logging.warning(f"⚠️ Model preload failed: {e}")
 
-DB_FILE      = "conversations.db"
-INDEX_FILE   = "website_index.faiss"
-CHUNKS_FILE  = "website_chunks.pkl"
-EMB_FILE     = "website_embeddings.npy"
+threading.Thread(target=preload_model).start()
 
-TOP_K = int(os.getenv("TOP_K", 5))
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.60))
-
-# ---------------- FLASK APP ----------------
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("GSBG-Chatbot")
-
-# ---------------- DATABASE ----------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
+# -------------------- DATABASE --------------------
+def ensure_db():
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            query TEXT,
-            response TEXT,
-            sources TEXT,
-            best_similarity REAL,
-            created_at TEXT
+            query TEXT UNIQUE,
+            answer TEXT,
+            confidence REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            query TEXT PRIMARY KEY,
-            vector BLOB,
-            created_at TEXT
-        )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-def get_cached_embedding(query):
-    conn = sqlite3.connect(DB_FILE)
+ensure_db()
+
+def get_cached_answer(query):
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT vector FROM embedding_cache WHERE query = ?", (query,))
+    cur.execute("SELECT answer FROM logs WHERE query = ?", (query,))
     row = cur.fetchone()
     conn.close()
-    if row and row[0]:
-        return pickle.loads(row[0])
-    return None
+    return row[0] if row else None
 
-def set_cached_embedding(query, vector):
-    conn = sqlite3.connect(DB_FILE)
+def save_answer(query, answer, confidence):
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "REPLACE INTO embedding_cache (query, vector, created_at) VALUES (?, ?, ?)",
-        (query, pickle.dumps(vector), datetime.utcnow().isoformat())
+        "INSERT OR REPLACE INTO logs (query, answer, confidence) VALUES (?, ?, ?)",
+        (query, answer, confidence),
     )
     conn.commit()
     conn.close()
 
-def log_conversation(query, response, sources=None, best_similarity=None):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO conversations (query, response, sources, best_similarity, created_at) VALUES (?, ?, ?, ?, ?)",
-        (query, response, json.dumps(sources) if sources else None, best_similarity, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+# -------------------- SEMANTIC SEARCH --------------------
+def semantic_search(query, top_k=5):
+    if kb_embeddings.size == 0:
+        return [], []
+    if query in query_cache:
+        query_vec = query_cache[query]
+    else:
+        query_vec = embedding_model.encode([query])[0]
+        query_vec = query_vec / np.linalg.norm(query_vec)
+        query_cache[query] = query_vec
+    sims = np.dot(kb_embeddings, query_vec)
+    top_indices = sims.argsort()[::-1][:top_k]
+    return [kb_chunks[i] for i in top_indices], sims[top_indices]
 
-# ---------------- EMBEDDINGS ----------------
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-def embed_query_local(q):
-    cached = get_cached_embedding(q)
-    if cached is not None:
-        return cached
-    v = embed_model.encode([q], normalize_embeddings=True)
-    v = np.array(v, dtype="float32")
-    set_cached_embedding(q, v)
-    return v
-
-def find_similar_conversations(query, top_k=3, threshold=None):
-    thr = SIMILARITY_THRESHOLD if threshold is None else float(threshold)
+# -------------------- RESPONSE GENERATION --------------------
+def generate_response(context, query):
     try:
-        q_emb = embed_query_local(query)
-        if q_emb.ndim == 1:
-            q_emb = q_emb.reshape(1, -1)
+        system_prompt = (
+            "You are GSBG Technologies' official AI assistant. "
+            "GSBG Technologies is a Salesforce CRM and Consulting Partner providing CRM solutions, FinTech consulting, and AI-driven business automation. "
+            "Always answer confidently and concisely. If unsure, politely recommend contacting GSBG’s support."
+        )
 
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("SELECT query, response FROM conversations")
-        rows = cur.fetchall()
-        conn.close()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Relevant Info:\n{context}\n\nUser Question: {query}"}
+        ]
 
-        if not rows:
-            return []
+        start = time.time()
+        response = ollama.chat(model=MODEL_NAME, messages=messages)
+        duration = time.time() - start
+        logging.info(f"🧠 Model responded in {duration:.2f}s")
 
-        queries = [row[0] for row in rows]
-        responses = [row[1] for row in rows]
+        answer = response.get("message", {}).get("content", "").strip()
+        if not answer:
+            answer = "I'm sorry, I couldn’t find the information you’re looking for."
+        return answer
+    except Exception as e:
+        logging.error(f"❌ LLM Error: {e}")
+        return "I'm sorry, something went wrong. Please try again later."
 
-        past_embs = np.vstack([embed_query_local(q).reshape(1, -1) for q in queries]).astype("float32")
-        sims = (past_embs @ q_emb.T).flatten()
-        top_idxs = np.argsort(sims)[-top_k:][::-1]
-
-        return [(queries[i], responses[i], float(sims[i])) for i in top_idxs if float(sims[i]) > thr]
-
-    except Exception:
-        logger.exception("Failed to find similar conversations")
-        return []
-
-# ---------------- KNOWLEDGE BASE ----------------
-index, chunks_meta, embeddings = None, [], None
-
-def load_kb():
-    global index, chunks_meta, embeddings
-    try:
-        if faiss and os.path.exists(INDEX_FILE) and os.path.exists(CHUNKS_FILE) and os.path.exists(EMB_FILE):
-            index = faiss.read_index(INDEX_FILE)
-            with open(CHUNKS_FILE, "rb") as f:
-                chunks_meta = pickle.load(f)
-            embeddings = np.load(EMB_FILE)
-            logger.info("Loaded FAISS index with %d chunks", len(chunks_meta))
-        else:
-            chunks_meta = [{"text": "GSBG Technologies is a Salesforce consulting company.", "source": "gsbg_intro"}]
-    except Exception:
-        logger.exception("Failed to load KB")
-
-load_kb()
-
-def aggregate_context(candidates, max_chars=1500, max_chunks=5):
-    seen, parts, sources, count = set(), [], [], 0
-    for item in sorted(candidates, key=lambda x: x[1], reverse=True):
-        m = item[0]; text = m.get("text", "")
-        source = m.get("source", "From KB")
-        key = text.strip()[:200]
-        if key in seen:
-            continue
-        seen.add(key)
-        parts.append(text.strip())
-        sources.append(source)
-        count += 1
-        if sum(len(p) for p in parts) >= max_chars or count >= max_chunks:
-            break
-    return ("\n\n".join(parts), sources)
-
-def find_chunks_by_keywords(keywords, max_add=3):
-    found = []
-    kws = [k.lower() for k in keywords]
-    for idx, meta in enumerate(chunks_meta):
-        text = meta.get("text", "")
-        src = meta.get("source", "")
-        lower = (text + " " + src).lower()
-        if any(k in lower for k in kws):
-            found.append((meta, 0.95, idx))
-    unique, out = [], []
-    for m, s, i in found:
-        src = m.get("source")
-        if src and src in unique:
-            continue
-        if src:
-            unique.append(src)
-        out.append((m, s, i))
-        if len(out) >= max_add:
-            break
-    return out
-
-def prefer_gsbg(candidates):
-    return sorted(candidates, key=lambda item: item[1] + (0.5 if "gsbg" in item[0].get("text", "").lower() else 0), reverse=True)
-
-# ---------------- LLM ----------------
-def strip_think_blocks(text):
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip() if text else text
-
-def generate_with_ollama(prompt, model=None):
-    model = model or OLLAMA_MODEL
-    try:
-        payload = {"model": model, "prompt": prompt, "stream": False}
-        url = f"{OLLAMA_URL}/api/generate"
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        text = data.get("response") or data.get("text") or str(data)
-        return strip_think_blocks(text)
-    except Exception:
-        logger.exception("Ollama request failed")
-        return None
-
-# ---------------- TWILIO ----------------
-def send_sms_to_user(user_number, user_query):
-    if not twilio_client or not TWILIO_FROM_NUMBER:
-        logger.error("Twilio not configured")
-        return None
-    body = f"Hello! GSBG Support received your query:\n\"{user_query}\"\nOur team will contact you shortly."
-    message = twilio_client.messages.create(
-        body=body,
-        from_=TWILIO_FROM_NUMBER,
-        to=user_number
-    )
-    return message.sid
-
-# ---------------- CONVERSATIONAL ----------------
-def handle_conversational(query):
-    GREETINGS = [re.compile(r"\bhello\b", re.I), re.compile(r"\bhi\b", re.I), re.compile(r"\bhey\b", re.I)]
-    SMALLTALK = [re.compile(r"\bhow are you\b", re.I), re.compile(r"\bwhat's up\b", re.I)]
-    if any(p.search(query) for p in GREETINGS):
-        return "Hello! Welcome to GSBG Technologies. How can I help you today?", ["system"]
-    if any(p.search(query) for p in SMALLTALK):
-        return "I'm great, thank you for asking. How can I assist you with GSBG or Salesforce?", ["system"]
-    return None, None
-
-# ---------------- FLASK ENDPOINT ----------------
+# -------------------- CHAT ENDPOINT --------------------
 @app.route("/chat", methods=["POST"])
-def chat_endpoint():
-    data = request.json or {}
-    query = (data.get("query") or "").strip()
-    user_number = data.get("phone")  # User phone for SMS
-    escalation = False
-
+def chat():
+    data = request.get_json() or {}
+    query = data.get("query", "").strip().lower()
     if not query:
-        return jsonify({"response": "Please ask a question.", "sources": ["system"], "escalation": False}), 400
+        return jsonify({"error": "Query is required"}), 400
 
-    # 1. Greetings / Smalltalk
-    convo_ans, convo_src = handle_conversational(query)
-    if convo_ans:
-        return jsonify({"response": convo_ans, "sources": convo_src, "escalation": False})
+    logging.info(f"💬 User query: {query}")
 
-    # 2. Similar conversation cache
-    similar = find_similar_conversations(query, top_k=1)
-    if similar:
-        past_query, past_response, sim = similar[0]
-        if sim > 0.75:
-            return jsonify({"response": past_response, "sources": ["cache"], "escalation": False})
+    # Static responses
+    for key, reply in STATIC_RESPONSES.items():
+        if key in query:
+            return jsonify({"answer": reply, "confidence": 1.0, "source": "static"})
 
-    # 3. Knowledge Base retrieval
-    candidates = []
-    if index and faiss:
-        try:
-            q_emb = embed_query_local(query)
-            D, I = index.search(q_emb, TOP_K)
-            for idx, sim in zip(I[0], D[0]):
-                if 0 <= idx < len(chunks_meta):
-                    candidates.append((chunks_meta[idx], float(sim)))
-        except Exception:
-            logger.exception("FAISS search failed")
-    if not candidates:
-        candidates = [(m, 0.95) for m, _, _ in find_chunks_by_keywords([query], max_add=TOP_K)]
+    # Cached response
+    cached = get_cached_answer(query)
+    if cached:
+        logging.info("📦 Serving cached response.")
+        return jsonify({"answer": cached, "confidence": 0.95, "source": "cache"})
 
-    candidates = prefer_gsbg(candidates)
-    context, sources = aggregate_context(candidates, max_chars=1500, max_chunks=5)
+    # Knowledge Base
+    chunks, sims = semantic_search(query)
+    if not chunks:
+        return jsonify({"answer": "I couldn’t find relevant information in the knowledge base."})
 
-    # 4. LLM prompt
-    prompt = f"""
-You are an intelligent assistant for GSBG Technologies.
-Use ONLY the context below to answer. Summarize, do not copy. Cite sources clearly.
-If unsure, say: "I’m sorry, I don’t have that information — please contact our support."
+    context = "\n\n".join(c.get("text", "") for c in chunks)
+    confidence = float(np.max(sims)) if len(sims) > 0 else 0.0
 
-Context:
-{context}
+    answer = generate_response(context, query)
+    save_answer(query, answer, confidence)
 
-Question: {query}
-Answer (short paragraph or bullets, source at end):
-"""
-    answer = generate_with_ollama(prompt) or context[:500]
-    answer = strip_think_blocks(answer)
+    return jsonify({"answer": answer, "confidence": round(confidence, 3), "source": "model"})
 
-    # 5. Escalation
-    if ("urgent" in query.lower() or "don't understand" in query.lower() or 
-        "help" in query.lower() or answer.startswith("I’m sorry")):
-        escalation = True
-        if not user_number:
-            log_conversation(query, answer, sources=sources)
-            return jsonify({
-                "response": "I’m sorry I couldn't assist. Please enter your phone number so our GSBG support team can contact you via SMS.",
-                "sources": sources,
-                "escalation": True
-            })
-        else:
-            sms_sid = send_sms_to_user(user_number, query)
-            log_conversation(query, f"Escalated: {answer}", sources=sources)
-            return jsonify({
-                "response": f"Our support team has been notified and you will receive an SMS shortly.",
-                "sources": sources,
-                "escalation": True
-            })
+# -------------------- CHAT UI --------------------
+@app.route("/chatbot")
+def serve_chat_ui():
+    return send_from_directory("templates", "chat.html")
 
-    log_conversation(query, answer, sources=sources)
-    return jsonify({"response": answer, "sources": sources, "escalation": False})
+# -------------------- HEALTH --------------------
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({
+        "message": "✅ GSBG AI Chatbot is running",
+        "model": MODEL_NAME,
+        "kb_chunks": len(kb_chunks),
+        "port": PORT
+    })
 
-@app.route("/")
-def home():
-    return render_template("chat.html")
-
+# -------------------- START SERVER --------------------
 if __name__ == "__main__":
-    init_db()
-    logger.info("Starting GSBG Chatbot")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    logging.info(f"🌐 Visit Chatbot at: http://127.0.0.1:{PORT}/chatbot")
+    app.run(host="0.0.0.0", port=PORT)
